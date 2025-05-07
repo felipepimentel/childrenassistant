@@ -28,25 +28,96 @@ import {
 } from "@/components/ui/alert-dialog";
 import { PlusCircle, Pencil, Trash2, GripVertical } from 'lucide-react';
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  DndContext,
+  closestCenter,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  DragEndEvent,
+} from '@dnd-kit/core';
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  verticalListSortingStrategy,
+  useSortable
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 
 // Esquema de validação para o formulário da tarefa
 const taskSchema = z.object({
   id: z.string().optional(),
   description: z.string().min(1, { message: "Descrição é obrigatória" }),
-  // Adicionar outros campos se necessário, como prioridade, tempo estimado etc.
 });
 
 type TaskFormValues = z.infer<typeof taskSchema>;
 
 interface Task {
   id: string;
-  routine_id?: string; // Pode ser útil se tivermos múltiplas rotinas no futuro
+  routine_id?: string; 
   user_id: string;
   child_id: string;
   description: string;
   is_completed: boolean;
   order: number;
   created_at?: string;
+}
+
+// Componente SortableTaskItem
+function SortableTaskItem({ task, onToggleCompletion, onOpenModal, onDeleteTask }: { task: Task, onToggleCompletion: (task: Task) => void, onOpenModal: (task: Task) => void, onDeleteTask: (taskId: string) => void }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: task.id });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+    zIndex: isDragging ? 10 : 'auto',
+  };
+
+  return (
+    <div ref={setNodeRef} style={style} {...attributes} className="mb-3">
+        <Card className="dark:bg-gray-700 flex items-center p-3 shadow-sm hover:shadow-md transition-shadow">
+            <button {...listeners} className="mr-2 p-1 cursor-grab touch-none">
+                 <GripVertical className="h-5 w-5 text-gray-400 dark:text-gray-500" />
+            </button>
+            <Checkbox
+                id={`task-${task.id}`}
+                checked={task.is_completed}
+                onCheckedChange={() => onToggleCompletion(task)}
+                className="mr-3 data-[state=checked]:bg-green-500 dark:data-[state=checked]:bg-green-600 border-gray-400 dark:border-gray-500"
+            />
+            <label htmlFor={`task-${task.id}`} className={`flex-grow cursor-pointer ${task.is_completed ? "line-through text-gray-500 dark:text-gray-400" : "dark:text-gray-100"}`}>
+                {task.description}
+            </label>
+            <div className="flex items-center space-x-2 ml-2">
+                <Button variant="outline" size="icon" onClick={() => onOpenModal(task)} className="dark:hover:bg-gray-600 h-8 w-8">
+                    <Pencil className="h-4 w-4" />
+                </Button>
+                <AlertDialog>
+                    <AlertDialogTrigger asChild>
+                        <Button variant="destructive" size="icon" className="h-8 w-8">
+                            <Trash2 className="h-4 w-4" />
+                        </Button>
+                    </AlertDialogTrigger>
+                    <AlertDialogContent className="dark:bg-gray-900">
+                        <AlertDialogHeader>
+                            <AlertDialogTitle>Confirmar Exclusão</AlertDialogTitle>
+                            <AlertDialogDescription>
+                                Tem certeza que deseja excluir a tarefa "{task.description}"? Esta ação não poderá ser desfeita.
+                            </AlertDialogDescription>
+                        </AlertDialogHeader>
+                        <AlertDialogFooter>
+                            <AlertDialogCancel className="dark:hover:bg-gray-700">Cancelar</AlertDialogCancel>
+                            <AlertDialogAction onClick={() => onDeleteTask(task.id)} className="bg-red-600 hover:bg-red-700 dark:bg-red-700 dark:hover:bg-red-800">Excluir</AlertDialogAction>
+                        </AlertDialogFooter>
+                    </AlertDialogContent>
+                </AlertDialog>
+            </div>
+        </Card>
+    </div>
+  );
 }
 
 export default function RotinaPage() {
@@ -57,6 +128,13 @@ export default function RotinaPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isTaskModalOpen, setIsTaskModalOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<Task | null>(null);
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }), // Permite clique normal sem iniciar drag imediatamente
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    })
+  );
 
   const form = useForm<TaskFormValues>({
     resolver: zodResolver(taskSchema),
@@ -108,7 +186,6 @@ export default function RotinaPage() {
     setIsSubmitting(true);
     try {
       if (editingTask) {
-        // Atualizar tarefa existente
         const { error } = await supabase
           .from("routine_tasks")
           .update({ description: values.description })
@@ -117,15 +194,14 @@ export default function RotinaPage() {
         if (error) throw error;
         toast({ title: "Sucesso!", description: "Tarefa atualizada com sucesso." });
       } else {
-        // Criar nova tarefa
-        const maxOrder = tasks.reduce((max, task) => Math.max(max, task.order), -1);
+        const maxOrder = tasks.length > 0 ? Math.max(...tasks.map(t => t.order)) : -1;
         const { error } = await supabase.from("routine_tasks").insert([
           {
             description: values.description,
             child_id: selectedChildId,
             user_id: user.id,
             is_completed: false,
-            order: maxOrder + 1, // Adiciona ao final da lista
+            order: maxOrder + 1,
           },
         ]);
         if (error) throw error;
@@ -176,8 +252,31 @@ export default function RotinaPage() {
     }
   };
 
-  // TODO: Implementar lógica de reordenação (drag and drop)
-  // const handleDragEnd = (result: any) => { ... }
+  async function handleDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    if (over && active.id !== over.id) {
+      const oldIndex = tasks.findIndex((task) => task.id === active.id);
+      const newIndex = tasks.findIndex((task) => task.id === over.id);
+      const newTasksOrder = arrayMove(tasks, oldIndex, newIndex);
+      setTasks(newTasksOrder);
+
+      // Atualizar a ordem no Supabase
+      const updates = newTasksOrder.map((task, index) => ({
+        id: task.id,
+        order: index,
+      }));
+
+      try {
+        const { error } = await supabase.from("routine_tasks").upsert(updates);
+        if (error) throw error;
+        toast({ title: "Sucesso!", description: "Ordem das tarefas atualizada." });
+      } catch (error: any) {
+        console.error("Erro ao atualizar ordem das tarefas:", error);
+        toast({ title: "Erro ao reordenar", description: "Não foi possível salvar a nova ordem.", variant: "destructive" });
+        fetchTasks(); // Reverter para a ordem anterior em caso de erro
+      }
+    }
+  }
 
   const selectedProfile = childrenProfiles.find(p => p.child_id === selectedChildId);
 
@@ -212,47 +311,15 @@ export default function RotinaPage() {
             <p className="text-center py-4 text-gray-500 dark:text-gray-400">Nenhuma tarefa encontrada. Adicione a primeira!</p>
           )}
           {!isLoading && tasks.length > 0 && (
-            // TODO: Envolver com react-beautiful-dnd ou similar para drag and drop
-            <div className="space-y-3">
-              {tasks.map((task, index) => (
-                <Card key={task.id} className="dark:bg-gray-700 flex items-center p-3 shadow-sm hover:shadow-md transition-shadow">
-                  {/* <GripVertical className="h-5 w-5 mr-2 text-gray-400 cursor-grab" /> */}
-                  <Checkbox
-                    id={`task-${task.id}`}
-                    checked={task.is_completed}
-                    onCheckedChange={() => toggleTaskCompletion(task)}
-                    className="mr-3 data-[state=checked]:bg-green-500 dark:data-[state=checked]:bg-green-600 border-gray-400 dark:border-gray-500"
-                  />
-                  <label htmlFor={`task-${task.id}`} className={`flex-grow cursor-pointer ${task.is_completed ? "line-through text-gray-500 dark:text-gray-400" : "dark:text-gray-100"}`}>
-                    {task.description}
-                  </label>
-                  <div className="flex items-center space-x-2 ml-2">
-                    <Button variant="outline" size="icon" onClick={() => handleOpenTaskModal(task)} className="dark:hover:bg-gray-600 h-8 w-8">
-                      <Pencil className="h-4 w-4" />
-                    </Button>
-                    <AlertDialog>
-                      <AlertDialogTrigger asChild>
-                        <Button variant="destructive" size="icon" className="h-8 w-8">
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </AlertDialogTrigger>
-                      <AlertDialogContent className="dark:bg-gray-900">
-                        <AlertDialogHeader>
-                          <AlertDialogTitle>Confirmar Exclusão</AlertDialogTitle>
-                          <AlertDialogDescription>
-                            Tem certeza que deseja excluir a tarefa "{task.description}"? Esta ação não poderá ser desfeita.
-                          </AlertDialogDescription>
-                        </AlertDialogHeader>
-                        <AlertDialogFooter>
-                          <AlertDialogCancel className="dark:hover:bg-gray-700">Cancelar</AlertDialogCancel>
-                          <AlertDialogAction onClick={() => handleDeleteTask(task.id)} className="bg-red-600 hover:bg-red-700 dark:bg-red-700 dark:hover:bg-red-800">Excluir</AlertDialogAction>
-                        </AlertDialogFooter>
-                      </AlertDialogContent>
-                    </AlertDialog>
-                  </div>
-                </Card>
-              ))}
-            </div>
+            <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+              <SortableContext items={tasks.map(t => t.id)} strategy={verticalListSortingStrategy}>
+                <div className="space-y-0"> {/* Removido space-y-3 para controle pelo SortableTaskItem */}
+                  {tasks.map((task) => (
+                    <SortableTaskItem key={task.id} task={task} onToggleCompletion={toggleTaskCompletion} onOpenModal={handleOpenTaskModal} onDeleteTask={handleDeleteTask} />
+                  ))}
+                </div>
+              </SortableContext>
+            </DndContext>
           )}
         </CardContent>
       </Card>
